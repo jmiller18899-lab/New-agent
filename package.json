@@ -1,7 +1,7 @@
 {
   "name": "clawdbot-mission-control",
-  "version": "4.2.0",
-  "description": "ClawdBot Mission Control frontend + secure Anthropic proxy API",
+  "version": "4.2.1",
+  "description": "ClawdBot Mission Control secure Anthropic proxy API (zero external dependencies)",
   "type": "module",
   "main": "server.js",
   "engines": {
@@ -9,19 +9,6 @@
   },
   "scripts": {
     "start": "node server.js",
-    "dev:api": "node --watch server.js",
-    "dev:web": "vite",
-    "build:web": "vite build",
-    "preview:web": "vite preview"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.21.1",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.3",
-    "vite": "^5.4.10"
+    "dev": "node --watch server.js"
   }
 }

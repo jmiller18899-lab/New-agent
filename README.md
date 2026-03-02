@@ -1,6 +1,6 @@
 # ClawdBot Mission Control
 
-Secure Express proxy between a React frontend and Anthropic's Claude API.
+Secure Anthropic proxy API server with zero external runtime dependencies.
 
 ## Quick start
 
@@ -8,14 +8,10 @@ Secure Express proxy between a React frontend and Anthropic's Claude API.
 npm install
 cp .env.example .env
 # set ANTHROPIC_API_KEY in .env
-npm run dev:api
+npm start
 ```
 
-In another terminal:
-
-```bash
-npm run dev:web
-```
+Server runs at `http://localhost:8080`.
 
 ## Docker
 
@@ -25,8 +21,14 @@ cp .env.example .env
 docker compose up --build
 ```
 
-API health: `http://localhost:8080/health`
+## Endpoints
+
+- `GET /`
+- `GET /health`
+- `GET /api/health`
+- `POST /api/claude`
+- `POST /api/claude-agent`
 
 ## Environment variables
 
-See `.env.example` for all settings.
+See `.env.example`.

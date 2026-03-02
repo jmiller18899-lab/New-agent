@@ -1,19 +1,18 @@
-import express from "express";
-import cors from "cors";
+import http from "node:http";
 
 const CONFIG = {
-  port: parseInt(process.env.PORT, 10) || 8080,
+  port: Number.parseInt(process.env.PORT || "8080", 10),
   apiKey: process.env.ANTHROPIC_API_KEY || "",
   defaultModel: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514",
   anthropicBase: process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
   anthropicVersion: "2023-06-01",
   allowedOrigins: process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim())
-    : true,
-  bodyLimit: process.env.BODY_LIMIT || "2mb",
+    : ["*"],
+  bodyLimitBytes: 2 * 1024 * 1024,
   rateLimit: {
     windowMs: 60_000,
-    maxRequests: parseInt(process.env.RATE_LIMIT, 10) || 30,
+    maxRequests: Number.parseInt(process.env.RATE_LIMIT || "30", 10),
   },
   maxTokensCap: {
     singleTurn: 4096,
@@ -21,27 +20,51 @@ const CONFIG = {
   },
 };
 
-const app = express();
-app.use(
-  cors({
-    origin: CONFIG.allowedOrigins,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  }),
-);
-app.use(express.json({ limit: CONFIG.bodyLimit }));
-
-app.use((req, _res, next) => {
-  if (req.method !== "OPTIONS") {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  }
-  next();
-});
-
 const hits = new Map();
-function rateLimit(req, res, next) {
-  const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+
+function allowOrigin(origin) {
+  if (!origin) return "*";
+  if (CONFIG.allowedOrigins.includes("*")) return "*";
+  return CONFIG.allowedOrigins.includes(origin) ? origin : "null";
+}
+
+function writeJson(res, status, data, origin = "*") {
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "access-control-allow-origin": allowOrigin(origin),
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-headers": "Content-Type, Authorization",
+  });
+  res.end(JSON.stringify(data));
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > CONFIG.bodyLimitBytes) {
+        reject(new Error("Payload too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (chunks.length === 0) return resolve({});
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch {
+        reject(new Error("Invalid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function rateLimit(req, origin, res) {
+  const ip = req.socket.remoteAddress || "unknown";
   const now = Date.now();
   const entry = hits.get(ip) || { count: 0, start: now };
   if (now - entry.start > CONFIG.rateLimit.windowMs) {
@@ -51,14 +74,15 @@ function rateLimit(req, res, next) {
   entry.count += 1;
   hits.set(ip, entry);
   if (entry.count > CONFIG.rateLimit.maxRequests) {
-    return res.status(429).json({
-      error: {
-        type: "rate_limit",
-        message: `Too many requests. Limit: ${CONFIG.rateLimit.maxRequests}/min. Try again shortly.`,
-      },
-    });
+    writeJson(
+      res,
+      429,
+      { error: { type: "rate_limit", message: `Too many requests. Limit: ${CONFIG.rateLimit.maxRequests}/min.` } },
+      origin,
+    );
+    return false;
   }
-  return next();
+  return true;
 }
 
 setInterval(() => {
@@ -68,130 +92,144 @@ setInterval(() => {
   }
 }, 300_000);
 
-function requireKey(res) {
-  if (!CONFIG.apiKey) {
-    res.status(500).json({
-      error: {
-        type: "config_error",
-        message: "ANTHROPIC_API_KEY is not set. Add it to your environment variables.",
-      },
-    });
-    return false;
-  }
-  return true;
-}
-
-function clampTokens(requested, cap) {
-  const n = parseInt(requested, 10);
-  if (!n || n < 1) return Math.min(1000, cap);
-  return Math.min(n, cap);
-}
-
 function sanitizeMessages(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((m) => m && typeof m === "object" && (m.role === "user" || m.role === "assistant"))
-    .map((m) => ({
-      role: m.role,
-      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-    }));
+    .map((m) => ({ role: m.role, content: typeof m.content === "string" ? m.content : JSON.stringify(m.content) }));
 }
 
-async function anthropicFetch(body) {
-  const res = await fetch(`${CONFIG.anthropicBase}/v1/messages`, {
+function clampTokens(requested, cap) {
+  const n = Number.parseInt(requested, 10);
+  if (!n || n < 1) return Math.min(1000, cap);
+  return Math.min(n, cap);
+}
+
+function extractText(data) {
+  if (!Array.isArray(data?.content)) return "";
+  return data.content.filter((b) => b?.type === "text").map((b) => b.text || "").join("").trim();
+}
+
+async function anthropicFetch(payload) {
+  const response = await fetch(`${CONFIG.anthropicBase}/v1/messages`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       "x-api-key": CONFIG.apiKey,
       "anthropic-version": CONFIG.anthropicVersion,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
-  const data = await res.json();
-  return { ok: res.ok, status: res.status, data };
+  const data = await response.json();
+  return { ok: response.ok, status: response.status, data };
 }
 
-function extractText(data) {
-  if (!data?.content || !Array.isArray(data.content)) return "";
-  return data.content
-    .filter((b) => b?.type === "text")
-    .map((b) => b.text || "")
-    .join("")
-    .trim();
-}
+const HOME_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ClawdBot Mission Control API</title>
+<style>body{font-family:system-ui;background:#06080c;color:#e4eaf4;margin:0;padding:24px}code{background:#151a28;padding:2px 6px;border-radius:6px}</style>
+</head><body>
+<h1>ClawdBot™ Mission Control API</h1>
+<p>Server is running.</p>
+<ul><li><code>GET /health</code></li><li><code>GET /api/health</code></li><li><code>POST /api/claude</code></li><li><code>POST /api/claude-agent</code></li></ul>
+</body></html>`;
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, version: "4.2.0", model: CONFIG.defaultModel, timestamp: new Date().toISOString() });
-});
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, version: "4.2.0" });
-});
-
-app.post("/api/claude", rateLimit, async (req, res) => {
-  try {
-    if (!requireKey(res)) return;
-    const { system, messages, model, max_tokens } = req.body;
-    const safeMessages = sanitizeMessages(messages);
-    if (safeMessages.length === 0) {
-      return res.status(400).json({ error: { type: "validation", message: "messages array is required and must contain at least one message." } });
-    }
-    const payload = {
-      model: model || CONFIG.defaultModel,
-      max_tokens: clampTokens(max_tokens, CONFIG.maxTokensCap.singleTurn),
-      messages: safeMessages,
-    };
-    if (system && typeof system === "string" && system.trim()) payload.system = system.trim();
-
-    const { ok, status, data } = await anthropicFetch(payload);
-    if (!ok) return res.status(status).json(data);
-
-    return res.json({
-      text: extractText(data),
-      model: data.model,
-      usage: data.usage || null,
-      stop_reason: data.stop_reason || null,
+const server = http.createServer(async (req, res) => {
+  const origin = req.headers.origin || "*";
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "access-control-allow-origin": allowOrigin(origin),
+      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-headers": "Content-Type, Authorization",
     });
-  } catch (err) {
-    console.error("[/api/claude] Unhandled:", err.message);
-    return res.status(500).json({ error: { type: "server_error", message: err.message } });
+    res.end();
+    return;
   }
-});
 
-app.post("/api/claude-agent", rateLimit, async (req, res) => {
-  try {
-    if (!requireKey(res)) return;
-    const { messages, model, max_tokens, system, tools } = req.body;
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(HOME_HTML);
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/health") {
+    writeJson(res, 200, { ok: true, version: "4.2.1", model: CONFIG.defaultModel, timestamp: new Date().toISOString() }, origin);
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/api/health") {
+    writeJson(res, 200, { ok: true, version: "4.2.1" }, origin);
+    return;
+  }
+
+  if (req.method === "POST" && (req.url === "/api/claude" || req.url === "/api/claude-agent")) {
+    if (!rateLimit(req, origin, res)) return;
+    if (!CONFIG.apiKey) {
+      writeJson(res, 500, { error: { type: "config_error", message: "ANTHROPIC_API_KEY is not set." } }, origin);
+      return;
+    }
+
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      writeJson(res, 400, { error: { type: "validation", message: err.message } }, origin);
+      return;
+    }
+
+    const { messages, model, max_tokens, system, tools } = body;
     const safeMessages = sanitizeMessages(messages);
     if (safeMessages.length === 0) {
-      return res.status(400).json({ error: { type: "validation", message: "messages array is required." } });
+      writeJson(res, 400, { error: { type: "validation", message: "messages array is required." } }, origin);
+      return;
     }
+
+    const isAgentRoute = req.url === "/api/claude-agent";
     const payload = {
       model: model || CONFIG.defaultModel,
-      max_tokens: clampTokens(max_tokens, CONFIG.maxTokensCap.agentTurn),
+      max_tokens: clampTokens(max_tokens, isAgentRoute ? CONFIG.maxTokensCap.agentTurn : CONFIG.maxTokensCap.singleTurn),
       messages: safeMessages,
     };
     if (system && typeof system === "string" && system.trim()) payload.system = system.trim();
-    if (Array.isArray(tools) && tools.length > 0) payload.tools = tools;
+    if (isAgentRoute && Array.isArray(tools) && tools.length > 0) payload.tools = tools;
 
-    const { ok, status, data } = await anthropicFetch(payload);
-    if (!ok) return res.status(status).json(data);
-    return res.json(data);
-  } catch (err) {
-    console.error("[/api/claude-agent] Unhandled:", err.message);
-    return res.status(500).json({ error: { type: "server_error", message: err.message } });
+    try {
+      const { ok, status, data } = await anthropicFetch(payload);
+      if (!ok) {
+        writeJson(res, status, data, origin);
+        return;
+      }
+      if (isAgentRoute) {
+        writeJson(res, 200, data, origin);
+        return;
+      }
+      writeJson(
+        res,
+        200,
+        {
+          text: extractText(data),
+          model: data.model,
+          usage: data.usage || null,
+          stop_reason: data.stop_reason || null,
+        },
+        origin,
+      );
+      return;
+    } catch (err) {
+      writeJson(res, 500, { error: { type: "server_error", message: err.message } }, origin);
+      return;
+    }
   }
+
+  writeJson(
+    res,
+    404,
+    { error: { type: "not_found", message: "Route not found. Available: GET /health, POST /api/claude, POST /api/claude-agent" } },
+    origin,
+  );
 });
 
-app.use((_req, res) => {
-  res.status(404).json({
-    error: {
-      type: "not_found",
-      message: "Route not found. Available: GET /health, POST /api/claude, POST /api/claude-agent",
-    },
-  });
-});
-
-app.listen(CONFIG.port, () => {
+server.listen(CONFIG.port, () => {
   const keyStatus = CONFIG.apiKey ? "set" : "MISSING";
   console.log(`ClawdBot API listening on :${CONFIG.port} (key ${keyStatus})`);
 });
