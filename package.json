@@ -1,0 +1,14 @@
+{
+  "name": "clawdbot-mission-control",
+  "version": "4.2.1",
+  "description": "ClawdBot Mission Control secure Anthropic proxy API (zero external dependencies)",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  }
+}
