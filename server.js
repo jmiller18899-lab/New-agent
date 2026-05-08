@@ -16,8 +16,8 @@ body: JSON.stringify(body),
 return { ok: r.ok, status: r.status, data: await r.json() };
 }
 
-app.get("/health", (*, res) => res.json({ ok: true }));
-app.get("/api/health", (*, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/api/claude", async (req, res) => {
 try {
